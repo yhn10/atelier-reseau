@@ -1,5 +1,5 @@
 
-name: Deploy to PythonAnywhere (recursive upload)
+name: Deploy to PythonAnywhere
 
 on:
   push:
@@ -11,11 +11,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Récupération du dépôt
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. Vérification des secrets
       - name: Check PythonAnywhere secrets
         id: secrets
         shell: bash
@@ -42,8 +40,7 @@ jobs:
             echo "ok=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # 3. Upload récursif vers PythonAnywhere
-      - name: Upload all files recursively
+      - name: Upload and reload PythonAnywhere
         if: steps.secrets.outputs.ok == 'true'
         shell: bash
         env:
@@ -60,30 +57,38 @@ jobs:
           TOKEN="$PA_TOKEN"
           TARGET_DIR="${PA_TARGET_DIR%/}"
           DOMAIN="$PA_WEBAPP_DOMAIN"
-
           HOST="${PA_HOST:-www.pythonanywhere.com}"
 
-          echo "PythonAnywhere host: $HOST"
+          echo "================================"
+          echo "PythonAnywhere deployment"
+          echo "================================"
+
+          echo "Host: $HOST"
           echo "Username: $USER"
-          echo "Target directory: $TARGET_DIR"
+          echo "Target: $TARGET_DIR"
 
           # Vérification des paramètres
           if [[ "$TARGET_DIR" != /home/* ]]; then
-            echo "::error::PA_TARGET_DIR doit être un chemin absolu sous /home/"
+            echo "::error::PA_TARGET_DIR doit commencer par /home/"
             exit 1
           fi
 
           if [[ "$USER" == *"/"* || "$USER" == *$'\n'* ]]; then
-            echo "::error::PA_USERNAME invalide"
+            echo "::error::Username invalide"
             exit 1
           fi
 
           if [[ "$HOST" == *"/"* || "$HOST" == *$'\n'* ]]; then
-            echo "::error::PA_HOST invalide"
+            echo "::error::Host invalide"
             exit 1
           fi
 
-          # Upload de tous les fichiers
+          if [[ "$DOMAIN" == *"/"* || "$DOMAIN" == *$'\n'* ]]; then
+            echo "::error::Domaine invalide"
+            exit 1
+          fi
+
+          # Upload récursif
           while IFS= read -r -d '' file; do
 
             rel="${file#./}"
@@ -100,22 +105,73 @@ jobs:
 
             remote_path="${TARGET_DIR}/${rel}"
 
-            # Encodage URL du chemin
-            encoded_path=$(python3 -c \
-              'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' \
-              "$remote_path")
+            # Construction et encodage de l'URL
+            UPLOAD_URL=$(python3 - "$HOST" "$USER" "$remote_path" <<'PY'
+          import sys
+          from urllib.parse import quote, urlsplit
 
-            # URL PythonAnywhere Files API
-            UPLOAD_URL="https://${HOST}/api/v0/user/${USER}/files/path${encoded_path}"
+          host, user, path = sys.argv[1:]
 
+          for name, value in [
+              ("HOST", host),
+              ("USER", user),
+              ("PATH", path),
+          ]:
+              if any(ord(c) < 32 or ord(c) == 127 for c in value):
+                  raise SystemExit(f"{name} contient un caractère de contrôle")
+
+          if not host or "/" in host or "://" in host:
+              raise SystemExit("HOST invalide")
+
+          if not user or "/" in user:
+              raise SystemExit("USER invalide")
+
+          if not path.startswith("/home/"):
+              raise SystemExit("PATH invalide")
+
+          url = (
+              f"https://{host}/api/v0/user/"
+              f"{quote(user, safe='')}/files/path"
+              f"{quote(path, safe='/')}"
+          )
+
+          parsed = urlsplit(url)
+
+          if parsed.scheme != "https" or not parsed.hostname:
+              raise SystemExit("URL invalide")
+
+          print(url)
+          PY
+          )
+
+            echo ""
             echo "Uploading: $rel"
 
-            curl -sS --fail-with-body \
-              -X POST \
-              -H "Authorization: Token ${TOKEN}" \
-              -F "content=@${file}" \
-              "$UPLOAD_URL" \
+            # Diagnostic sans afficher le token
+            python3 - "$UPLOAD_URL" <<'PY'
+          import sys
+          from urllib.parse import urlsplit
+
+          url = sys.argv[1]
+          p = urlsplit(url)
+
+          print("URL scheme:", p.scheme)
+          print("URL host:", repr(p.netloc))
+          print("URL path:", repr(p.path))
+
+          if p.scheme != "https" or not p.netloc:
+              raise SystemExit("URL incorrecte")
+          PY
+
+            # Envoi du fichier
+            curl --globoff -sS --fail-with-body \
+              --request POST \
+              --header "Authorization: Token ${TOKEN}" \
+              --form "content=@${file}" \
+              --url "$UPLOAD_URL" \
               >/dev/null
+
+            echo "Uploaded successfully: $rel"
 
           done < <(
             find . \
@@ -133,18 +189,22 @@ jobs:
                 -print0
           )
 
+          echo ""
           echo "All files uploaded successfully."
 
-          # 4. Rechargement de l'application web
-          echo "Reloading webapp: ${DOMAIN}"
+          # Rechargement de l'application
+          echo "Reloading webapp: $DOMAIN"
 
-          curl -sS --fail-with-body \
-            -X POST \
-            -H "Authorization: Token ${TOKEN}" \
-            "https://${HOST}/api/v0/user/${USER}/webapps/${DOMAIN}/reload/" \
+          RELOAD_URL="https://${HOST}/api/v0/user/${USER}/webapps/${DOMAIN}/reload/"
+
+          curl --globoff -sS --fail-with-body \
+            --request POST \
+            --header "Authorization: Token ${TOKEN}" \
+            --url "$RELOAD_URL" \
             >/dev/null
 
+          echo ""
           echo "================================"
-          echo "Deployment successful!"
+          echo "DEPLOYMENT SUCCESSFUL"
+          echo "================================"
           echo "Website: https://${DOMAIN}/"
-          echo "================================"
