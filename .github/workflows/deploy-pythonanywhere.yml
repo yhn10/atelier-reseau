@@ -1,3 +1,4 @@
+
 name: Deploy to PythonAnywhere (recursive upload)
 
 on:
@@ -13,9 +14,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Un dépôt créé avec "Use this template" lance ce workflow dès sa création,
-      # avant que les secrets soient configurés : on saute alors le déploiement
-      # au lieu d'afficher une erreur rouge.
       - name: Check PythonAnywhere secrets
         id: secrets
         shell: bash
@@ -26,65 +24,102 @@ jobs:
           PA_WEBAPP_DOMAIN: ${{ secrets.PA_WEBAPP_DOMAIN }}
         run: |
           missing=""
+
           for v in PA_USERNAME PA_TOKEN PA_TARGET_DIR PA_WEBAPP_DOMAIN; do
             [[ -z "${!v}" ]] && missing="$missing $v"
           done
+
           if [[ -n "$missing" ]]; then
-            echo "::warning::Secrets manquants :$missing — déploiement ignoré (voir Séquence 4 du README)."
+            echo "::warning::Secrets manquants :$missing"
             echo "ok=false" >> "$GITHUB_OUTPUT"
           else
             echo "ok=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload all files recursively (dirs auto-created by Files API)
+      - name: Upload all files recursively
         if: steps.secrets.outputs.ok == 'true'
         shell: bash
+        env:
+          PA_USERNAME: ${{ secrets.PA_USERNAME }}
+          PA_TOKEN: ${{ secrets.PA_TOKEN }}
+          PA_TARGET_DIR: ${{ secrets.PA_TARGET_DIR }}
+          PA_WEBAPP_DOMAIN: ${{ secrets.PA_WEBAPP_DOMAIN }}
+          PA_HOST: ${{ secrets.PA_HOST }}
+
         run: |
           set -euo pipefail
-          USER="${{ secrets.PA_USERNAME }}"
-          TOKEN="${{ secrets.PA_TOKEN }}"
-          TARGET_DIR="${{ secrets.PA_TARGET_DIR }}"
-          DOMAIN="${{ secrets.PA_WEBAPP_DOMAIN }}"
 
-          # Optional: set PA_HOST secret to "eu.pythonanywhere.com" if your account is on EU.
-          HOST="${{ secrets.PA_HOST }}"
-          if [[ -z "${HOST}" ]]; then HOST="www.pythonanywhere.com"; fi
+          USER="$PA_USERNAME"
+          TOKEN="$PA_TOKEN"
+          TARGET_DIR="${PA_TARGET_DIR%/}"
+          DOMAIN="$PA_WEBAPP_DOMAIN"
 
-          echo "Using PythonAnywhere host: ${HOST}"
-          echo "Target directory: ${TARGET_DIR}"
+          HOST="${PA_HOST:-www.pythonanywhere.com}"
 
-          # Upload every file; remote directories are created automatically by the Files API.
+          echo "PythonAnywhere host: $HOST"
+          echo "Target directory: $TARGET_DIR"
+
+          # Vérification des chemins
+          if [[ "$TARGET_DIR" != /home/* ]]; then
+            echo "::error::PA_TARGET_DIR doit être un chemin absolu sous /home/"
+            exit 1
+          fi
+
+          # Upload récursif
           while IFS= read -r -d '' file; do
+
             rel="${file#./}"
 
-            # Exclusions (adjust to taste)
+            # Exclusions
             case "$rel" in
-              .git/*|.github/*|.venv/*|__pycache__/*|node_modules/*) continue ;;
-              *.pyc|.DS_Store) continue ;;
+              .git/*|.github/*|.venv/*|venv/*|__pycache__/*|node_modules/*)
+                continue
+                ;;
+              .gitignore|*.pyc|.DS_Store)
+                continue
+                ;;
             esac
 
             remote_path="${TARGET_DIR}/${rel}"
-            echo " - ${rel} -> ${remote_path}"
 
-            curl -sS --fail -X POST \
+            # Encodage URL du chemin
+            encoded_path=$(python3 -c \
+              'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' \
+              "$remote_path")
+
+            echo "Uploading: $rel"
+
+            curl -sS --fail-with-body -X POST \
               -H "Authorization: Token ${TOKEN}" \
               -F "content=@${file}" \
-              "https://${HOST}/api/v0/user/${USER}/files/path${remote_path}" \
+              "https://${HOST}/api/v0/user/${USER}/files/path/${encoded_path}" \
               >/dev/null
 
           done < <(
             find . \
-              -type d \( -name .git -o -name .github -o -name .venv -o -name __pycache__ -o -name node_modules \) -prune -false \
+              -type d \( \
+                -name .git -o \
+                -name .github -o \
+                -name .venv -o \
+                -name venv -o \
+                -name __pycache__ -o \
+                -name node_modules \
+              \) -prune \
               -o -type f \
                 ! -name ".DS_Store" \
                 ! -name "*.pyc" \
                 -print0
           )
 
-          echo "Reloading webapp ${DOMAIN}..."
-          curl -sS --fail -X POST \
+          echo "All files uploaded successfully."
+
+          # Rechargement de l'application
+          echo "Reloading webapp: ${DOMAIN}"
+
+          curl -sS --fail-with-body -X POST \
             -H "Authorization: Token ${TOKEN}" \
             "https://${HOST}/api/v0/user/${USER}/webapps/${DOMAIN}/reload/" \
             >/dev/null
 
-          echo "Deployed. Try: https://${DOMAIN}/"
+          echo "Deployment successful!"
+          echo "Website: https://${DOMAIN}/"
