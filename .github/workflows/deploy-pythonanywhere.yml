@@ -11,9 +11,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Récupération du dépôt
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 2. Vérification des secrets
       - name: Check PythonAnywhere secrets
         id: secrets
         shell: bash
@@ -23,10 +25,14 @@ jobs:
           PA_TARGET_DIR: ${{ secrets.PA_TARGET_DIR }}
           PA_WEBAPP_DOMAIN: ${{ secrets.PA_WEBAPP_DOMAIN }}
         run: |
+          set -euo pipefail
+
           missing=""
 
           for v in PA_USERNAME PA_TOKEN PA_TARGET_DIR PA_WEBAPP_DOMAIN; do
-            [[ -z "${!v}" ]] && missing="$missing $v"
+            if [[ -z "${!v}" ]]; then
+              missing="$missing $v"
+            fi
           done
 
           if [[ -n "$missing" ]]; then
@@ -36,6 +42,7 @@ jobs:
             echo "ok=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # 3. Upload récursif vers PythonAnywhere
       - name: Upload all files recursively
         if: steps.secrets.outputs.ok == 'true'
         shell: bash
@@ -57,15 +64,26 @@ jobs:
           HOST="${PA_HOST:-www.pythonanywhere.com}"
 
           echo "PythonAnywhere host: $HOST"
+          echo "Username: $USER"
           echo "Target directory: $TARGET_DIR"
 
-          # Vérification des chemins
+          # Vérification des paramètres
           if [[ "$TARGET_DIR" != /home/* ]]; then
             echo "::error::PA_TARGET_DIR doit être un chemin absolu sous /home/"
             exit 1
           fi
 
-          # Upload récursif
+          if [[ "$USER" == *"/"* || "$USER" == *$'\n'* ]]; then
+            echo "::error::PA_USERNAME invalide"
+            exit 1
+          fi
+
+          if [[ "$HOST" == *"/"* || "$HOST" == *$'\n'* ]]; then
+            echo "::error::PA_HOST invalide"
+            exit 1
+          fi
+
+          # Upload de tous les fichiers
           while IFS= read -r -d '' file; do
 
             rel="${file#./}"
@@ -87,12 +105,16 @@ jobs:
               'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' \
               "$remote_path")
 
+            # URL PythonAnywhere Files API
+            UPLOAD_URL="https://${HOST}/api/v0/user/${USER}/files/path${encoded_path}"
+
             echo "Uploading: $rel"
 
-            curl -sS --fail-with-body -X POST \
+            curl -sS --fail-with-body \
+              -X POST \
               -H "Authorization: Token ${TOKEN}" \
               -F "content=@${file}" \
-              "https://${HOST}/api/v0/user/${USER}/files/path/${encoded_path}" \
+              "$UPLOAD_URL" \
               >/dev/null
 
           done < <(
@@ -113,13 +135,16 @@ jobs:
 
           echo "All files uploaded successfully."
 
-          # Rechargement de l'application
+          # 4. Rechargement de l'application web
           echo "Reloading webapp: ${DOMAIN}"
 
-          curl -sS --fail-with-body -X POST \
+          curl -sS --fail-with-body \
+            -X POST \
             -H "Authorization: Token ${TOKEN}" \
             "https://${HOST}/api/v0/user/${USER}/webapps/${DOMAIN}/reload/" \
             >/dev/null
 
+          echo "================================"
           echo "Deployment successful!"
           echo "Website: https://${DOMAIN}/"
+          echo "================================"
